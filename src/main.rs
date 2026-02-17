@@ -1,12 +1,16 @@
-use core::{fmt, hash};
+use core::fmt;
 use std::{
     ffi::CStr,
-    fs::{self, File, metadata},
-    io::{BufRead, BufReader, Read},
+    fs::{self, File},
+    io::{BufRead, BufReader, BufWriter, Read, Write},
 };
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+use flate2::Compression;
+use sha1::{Digest, Sha1};
+
+const GIT_OBJECT_PATH: &'static str = ".git/objects";
 
 #[derive(Debug, Subcommand)]
 enum Commands {
@@ -18,6 +22,12 @@ enum Commands {
         /// check if the object hash exist
         #[arg(short = 'e', conflicts_with = "pretty_print")]
         exist: Option<String>,
+    },
+    /// Hash object file to then write the content on git object
+    HashObject {
+        /// Write objects to object database
+        #[arg(short = 'w')]
+        write: String,
     },
 }
 
@@ -38,7 +48,6 @@ fn get_path_from_hash(object_hash: &str) -> (String, String) {
 }
 
 fn get_object_path(dir_path: &str, hash_path: &str) -> Result<String> {
-    const GIT_OBJECT_PATH: &'static str = ".git/objects";
     let full_dir_path = format!("{}/{}", GIT_OBJECT_PATH, dir_path);
     let mut possible_hash_path = Vec::new();
 
@@ -125,8 +134,48 @@ fn parse_object_hash(hash_object: &str) -> Result<ObjectHashTypes> {
     }
 }
 
+fn write_object_hash(object_hash_type: ObjectHashTypes) -> Result<String> {
+    match object_hash_type {
+        ObjectHashTypes::Blob(content) => {
+            let meta_data = format!("blob {}\0", content.len());
+            let mut hasher = Sha1::new();
+
+            hasher.update(&meta_data);
+            hasher.update(&content);
+
+            let hash_object = format!("{:x}", hasher.finalize());
+            let (dir_path, hash) = get_path_from_hash(&hash_object);
+            let full_dir_path = format!("{}/{}", GIT_OBJECT_PATH, dir_path);
+            let full_path = format!("{}/{}", full_dir_path, hash);
+
+            fs::create_dir_all(&full_dir_path)
+                .context(format!("creating directory {} failed", &full_dir_path))?;
+
+            if std::path::Path::new(&full_path).exists() {
+                return Ok(hash_object);
+            }
+
+            let file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&full_path)
+                .context(format!("opening {} failed", &full_path))?;
+
+            let buf_writer = BufWriter::new(file);
+            let mut zlib_encoder =
+                flate2::write::ZlibEncoder::new(buf_writer, Compression::default());
+
+            let _ = zlib_encoder.write(meta_data.as_bytes());
+            let _ = zlib_encoder.write(content.as_bytes());
+
+            Ok(hash_object)
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
     match cli.subcommands {
         Commands::CatFile {
             pretty_print,
@@ -150,6 +199,13 @@ fn main() -> Result<()> {
                 println!("invalid command")
             }
         },
+        Commands::HashObject { write } => {
+            let content =
+                String::from_utf8(fs::read(&write).context(format!("failed reading {}", &write))?)
+                    .context("failed parsing to string")?;
+            let hash_object = write_object_hash(ObjectHashTypes::Blob(content))?;
+            println!("written object hash: {}", hash_object);
+        }
     }
     Ok(())
 }
