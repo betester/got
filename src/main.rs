@@ -1,11 +1,11 @@
-use core::fmt;
+use core::{fmt, hash};
 use std::{
     ffi::CStr,
-    fs::File,
+    fs::{self, File, metadata},
     io::{BufRead, BufReader, Read},
 };
 
-use anyhow::{Context, Ok, Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
 #[derive(Debug, Subcommand)]
@@ -30,12 +30,40 @@ struct Cli {
 }
 
 fn get_path_from_hash(object_hash: &str) -> (String, String) {
-    return (object_hash[..2].to_string(), object_hash[2..].to_string());
+    const DIRECTORY_LENGTH: usize = 2;
+    return (
+        object_hash[..DIRECTORY_LENGTH].to_string(),
+        object_hash[DIRECTORY_LENGTH..].to_string(),
+    );
 }
 
-fn get_object_path(dir_path: &str, hash_path: &str) -> String {
+fn get_object_path(dir_path: &str, hash_path: &str) -> Result<String> {
     const GIT_OBJECT_PATH: &'static str = ".git/objects";
-    return format!("{}/{}/{}", GIT_OBJECT_PATH, dir_path, hash_path);
+    let full_dir_path = format!("{}/{}", GIT_OBJECT_PATH, dir_path);
+    let mut possible_hash_path = Vec::new();
+
+    for entry in fs::read_dir(&full_dir_path)? {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+
+        if metadata.is_file() {
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            if file_name.starts_with(hash_path) {
+                possible_hash_path.push(file_name);
+            }
+        }
+    }
+
+    if possible_hash_path.is_empty() {
+        bail!(format!("no matching path for hash: {}", hash_path));
+    } else if possible_hash_path.len() > 1 {
+        bail!(format!(
+            "multiple matching for hash: {} please specify",
+            hash_path
+        ));
+    }
+
+    return Ok(format!("{}/{}", full_dir_path, possible_hash_path[0]));
 }
 
 enum ObjectHashTypes {
@@ -53,7 +81,7 @@ impl fmt::Display for ObjectHashTypes {
 
 fn parse_object_hash(hash_object: &str) -> Result<ObjectHashTypes> {
     let (dir_path, object_path) = get_path_from_hash(&hash_object);
-    let object_path = get_object_path(&dir_path, &object_path);
+    let object_path = get_object_path(&dir_path, &object_path)?;
     let file =
         File::open(&object_path).context(format!("failed to read object path {}", &object_path))?;
 
@@ -104,19 +132,22 @@ fn main() -> Result<()> {
             pretty_print,
             exist,
         } => match (pretty_print, exist) {
-            (None, None) => {
-                println!("none were filled");
-            }
             (None, Some(hash)) => {
-                let object_hash = parse_object_hash(&hash)?;
-                println!("{}", object_hash);
+                let (dir_path, object_path) = get_path_from_hash(&hash);
+                let object_hash = get_object_path(&dir_path, &object_path);
+                match object_hash {
+                    Ok(full_object_hash) => {
+                        println!("object hash exist, with path: {}", full_object_hash)
+                    }
+                    Err(err) => println!("{}", err),
+                }
             }
             (Some(hash), None) => {
                 let object_hash = parse_object_hash(&hash)?;
                 print!("{}", object_hash);
             }
-            (Some(_), Some(_)) => {
-                println!("both somehow exists!")
+            (_, _) => {
+                println!("invalid command")
             }
         },
     }
