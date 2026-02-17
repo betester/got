@@ -1,8 +1,10 @@
 use core::fmt;
 use std::{
+    env,
     ffi::CStr,
     fs::{self, File},
     io::{BufRead, BufReader, BufWriter, Read, Write},
+    os::unix::fs::MetadataExt,
 };
 
 use anyhow::{Context, Result, bail};
@@ -31,7 +33,10 @@ enum Commands {
         write: String,
     },
     /// shows the tree on the current working directory based on the hash
-    LsTree { hash: String },
+    LsTree {
+        hash: String,
+    },
+    WriteTree,
 }
 
 #[derive(Debug, Parser)]
@@ -92,6 +97,18 @@ impl TreeNode {
             160000 => "commit",
             _ => "blob",
         }
+    }
+
+    fn encode(&self) -> Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        let _ =
+            write!(bytes, "{} {}\0", self.mode, self.name).context("writing to Vec is infallible");
+        let hash_bytes: Vec<u8> = (0..self.hash.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&self.hash[i..i + 2], 16).expect("invalid hex in hash"))
+            .collect();
+        bytes.extend_from_slice(&hash_bytes);
+        Ok(bytes)
     }
 }
 
@@ -214,44 +231,99 @@ fn parse_object_hash(hash_object: &str) -> Result<ObjectHashTypes> {
     }
 }
 
+fn write_object(meta_data: &[u8], content: &[u8]) -> Result<String> {
+    let mut hasher = Sha1::new();
+
+    hasher.update(&meta_data);
+    hasher.update(&content);
+
+    let hash_object = format!("{:x}", hasher.finalize());
+    let (dir_path, hash) = get_path_from_hash(&hash_object);
+    let full_dir_path = format!("{}/{}", GIT_OBJECT_PATH, dir_path);
+    let full_path = format!("{}/{}", full_dir_path, hash);
+
+    if std::path::Path::new(&full_path).exists() {
+        return Ok(hash_object);
+    }
+
+    fs::create_dir_all(&full_dir_path)
+        .context(format!("creating directory {} failed", &full_dir_path))?;
+
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&full_path)
+        .context(format!("opening {} failed", &full_path))?;
+
+    let buf_writer = BufWriter::new(file);
+    let mut zlib_encoder = flate2::write::ZlibEncoder::new(buf_writer, Compression::default());
+
+    let _ = zlib_encoder.write(meta_data);
+    let _ = zlib_encoder.write(content);
+
+    Ok(hash_object)
+}
+
 fn write_object_hash(object_hash_type: ObjectHashTypes) -> Result<String> {
-    match object_hash_type {
+    let (write_metadata, write_content) = match object_hash_type {
         ObjectHashTypes::Blob(content) => {
             let meta_data = format!("blob {}\0", content.len());
-            let mut hasher = Sha1::new();
-
-            hasher.update(&meta_data);
-            hasher.update(&content);
-
-            let hash_object = format!("{:x}", hasher.finalize());
-            let (dir_path, hash) = get_path_from_hash(&hash_object);
-            let full_dir_path = format!("{}/{}", GIT_OBJECT_PATH, dir_path);
-            let full_path = format!("{}/{}", full_dir_path, hash);
-
-            if std::path::Path::new(&full_path).exists() {
-                return Ok(hash_object);
-            }
-
-            fs::create_dir_all(&full_dir_path)
-                .context(format!("creating directory {} failed", &full_dir_path))?;
-
-            let file = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&full_path)
-                .context(format!("opening {} failed", &full_path))?;
-
-            let buf_writer = BufWriter::new(file);
-            let mut zlib_encoder =
-                flate2::write::ZlibEncoder::new(buf_writer, Compression::default());
-
-            let _ = zlib_encoder.write(meta_data.as_bytes());
-            let _ = zlib_encoder.write(content.as_bytes());
-
-            Ok(hash_object)
+            (meta_data.as_bytes().to_vec(), content.as_bytes().to_vec())
         }
-        ObjectHashTypes::Tree(items) => todo!(),
+        ObjectHashTypes::Tree(items) => {
+            let mut content = Vec::new();
+            for tree_node in items {
+                content.extend(tree_node.encode()?);
+            }
+            let meta_data = format!("tree {}\0", content.len());
+            (meta_data.as_bytes().to_vec(), content)
+        }
+    };
+
+    return write_object(&write_metadata, &write_content);
+}
+
+//@Performance: this is really slow, imagine hashing the whole content again and again
+fn get_tree_nodes_from_git_directory(path: &std::path::Path) -> Result<Vec<TreeNode>> {
+    const IGNORED_DIRECTORY: [&str; 2] = [".git", "target"];
+    let mut tree_nodes = Vec::new();
+
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+
+        if metadata.is_file() {
+            let content = String::from_utf8(
+                fs::read(entry.path()).context(format!("failed reading {:?}", &entry.path()))?,
+            )
+            .context(format!("failed parsing {:?} to string", entry.path()))?;
+            let hash_object = write_object_hash(ObjectHashTypes::Blob(content))?;
+            let git_mode = if metadata.mode() & 0o111 != 0 {
+                100755
+            } else {
+                100644
+            }; // some
+            // magic for getting the mode number, don't ask me why
+            tree_nodes.push(TreeNode {
+                name: entry.file_name().to_string_lossy().to_string(),
+                hash: hash_object,
+                mode: git_mode,
+            });
+        } else if !IGNORED_DIRECTORY.contains(&entry.file_name().to_str().with_context(
+            || "failed to get file name when checking whether directory should be ignored",
+        )?) {
+            let sub_tree_nodes = get_tree_nodes_from_git_directory(&entry.path())?;
+            let hash_object = write_object_hash(ObjectHashTypes::Tree(sub_tree_nodes))?;
+            tree_nodes.push(TreeNode {
+                name: entry.file_name().to_string_lossy().to_string(),
+                hash: hash_object,
+                mode: 40000,
+            });
+        }
     }
+
+    tree_nodes.sort_by(|a, b| a.name.cmp(&b.name));
+    return Ok(tree_nodes);
 }
 
 fn main() -> Result<()> {
@@ -289,7 +361,17 @@ fn main() -> Result<()> {
         }
         Commands::LsTree { hash } => {
             let object_hash = parse_object_hash(&hash)?;
-            print!("{}", object_hash);
+            match object_hash {
+                ObjectHashTypes::Tree(_) => println!("{}", object_hash),
+                _ => println!("fatal: not a tree object"),
+            }
+        }
+        Commands::WriteTree => {
+            let path = env::current_dir()?;
+            let tree_nodes = get_tree_nodes_from_git_directory(&path)?;
+
+            let hash = write_object_hash(ObjectHashTypes::Tree(tree_nodes))?;
+            println!("written object hash: {}", hash);
         }
     }
     Ok(())
