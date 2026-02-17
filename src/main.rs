@@ -11,6 +11,7 @@ use flate2::Compression;
 use sha1::{Digest, Sha1};
 
 const GIT_OBJECT_PATH: &'static str = ".git/objects";
+const NODE_HASH_BYTES_LENGTH: usize = 20;
 
 #[derive(Debug, Subcommand)]
 enum Commands {
@@ -29,6 +30,8 @@ enum Commands {
         #[arg(short = 'w')]
         write: String,
     },
+    /// shows the tree on the current working directory based on the hash
+    LsTree { hash: String },
 }
 
 #[derive(Debug, Parser)]
@@ -75,17 +78,67 @@ fn get_object_path(dir_path: &str, hash_path: &str) -> Result<String> {
     return Ok(format!("{}/{}", full_dir_path, possible_hash_path[0]));
 }
 
+struct TreeNode {
+    name: String,
+    hash: String,
+    mode: u32,
+}
+
+impl TreeNode {
+    fn mode_str(&self) -> &'static str {
+        match self.mode {
+            40000 => "tree",
+            100644 | 100755 | 120000 => "blob",
+            160000 => "commit",
+            _ => "blob",
+        }
+    }
+}
+
+impl fmt::Display for TreeNode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{:06} {} {}\t{}",
+            self.mode,
+            self.mode_str(),
+            self.hash,
+            self.name
+        )
+    }
+}
+
 enum ObjectHashTypes {
     Blob(String),
-    // fill in as needed
+    Tree(Vec<TreeNode>), // fill in as needed
 }
 
 impl fmt::Display for ObjectHashTypes {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ObjectHashTypes::Blob(content) => write!(f, "{}", content),
+            ObjectHashTypes::Tree(items) => {
+                for tree_node in items {
+                    writeln!(f, "{}", tree_node)?;
+                }
+                Ok(())
+            }
         }
     }
+}
+
+fn parse_file_metadata(meta_data: &str) -> Result<(&str, &str)> {
+    let mut meta_data_split = meta_data.split(" ");
+    let (first_data, second_data) = (
+        meta_data_split
+            .next()
+            .with_context(|| format!("no content type found on metadata: {}", &meta_data))?,
+        meta_data_split
+            .next()
+            .with_context(|| format!("no size found on metadata {}", &meta_data))?,
+    );
+
+    return Ok((first_data, second_data));
 }
 
 fn parse_object_hash(hash_object: &str) -> Result<ObjectHashTypes> {
@@ -109,16 +162,7 @@ fn parse_object_hash(hash_object: &str) -> Result<ObjectHashTypes> {
         ))?
         .to_str()?;
 
-    let mut meta_data_split = meta_data.split(" ");
-    let (content_type, content_size) = (
-        meta_data_split
-            .next()
-            .with_context(|| format!("no content type found on metadata: {}", &meta_data))?,
-        meta_data_split
-            .next()
-            .with_context(|| format!("no size found on metadata {}", &meta_data))?,
-    );
-
+    let (content_type, content_size) = parse_file_metadata(meta_data)?;
     let content_size: usize = content_size
         .parse()
         .with_context(|| format!("failed to parse content size, found {}", content_size))?;
@@ -130,6 +174,42 @@ fn parse_object_hash(hash_object: &str) -> Result<ObjectHashTypes> {
         "blob" => Ok(ObjectHashTypes::Blob(
             String::from_utf8(buffer).context("parsing buffer to string utf-8")?,
         )),
+        "tree" => {
+            let (mut position, mut tree_nodes) = (0, Vec::new());
+            while position < buffer.len() {
+                let null_offset = buffer[position..]
+                    .iter()
+                    .position(|&b| b == b'\0')
+                    .with_context(|| "failed finding nul delimiter for tree nodes content")?;
+
+                let metadata_end = position + null_offset;
+                let node_metadata = CStr::from_bytes_with_nul(&buffer[position..=metadata_end])
+                    .with_context(|| {
+                        format!("failed parsing metadata from object_hash: {}", &object_path)
+                    })?
+                    .to_str()?;
+
+                let (mode, name) = parse_file_metadata(node_metadata)?;
+                let mode: u32 = mode
+                    .parse()
+                    .with_context(|| format!("failed to parse mode, found {}", mode))?;
+
+                let sha_start = metadata_end + 1;
+                let node_hash = buffer[sha_start..sha_start + NODE_HASH_BYTES_LENGTH]
+                    .iter()
+                    .map(|b| format!("{:02x}", b))
+                    .collect::<String>();
+
+                tree_nodes.push(TreeNode {
+                    name: name.to_string(),
+                    mode,
+                    hash: node_hash,
+                });
+
+                position = sha_start + NODE_HASH_BYTES_LENGTH;
+            }
+            Ok(ObjectHashTypes::Tree(tree_nodes))
+        }
         _ => bail!(format!("unsupported type: {}", content_type)),
     }
 }
@@ -148,12 +228,12 @@ fn write_object_hash(object_hash_type: ObjectHashTypes) -> Result<String> {
             let full_dir_path = format!("{}/{}", GIT_OBJECT_PATH, dir_path);
             let full_path = format!("{}/{}", full_dir_path, hash);
 
-            fs::create_dir_all(&full_dir_path)
-                .context(format!("creating directory {} failed", &full_dir_path))?;
-
             if std::path::Path::new(&full_path).exists() {
                 return Ok(hash_object);
             }
+
+            fs::create_dir_all(&full_dir_path)
+                .context(format!("creating directory {} failed", &full_dir_path))?;
 
             let file = fs::OpenOptions::new()
                 .write(true)
@@ -170,6 +250,7 @@ fn write_object_hash(object_hash_type: ObjectHashTypes) -> Result<String> {
 
             Ok(hash_object)
         }
+        ObjectHashTypes::Tree(items) => todo!(),
     }
 }
 
@@ -205,6 +286,10 @@ fn main() -> Result<()> {
                     .context("failed parsing to string")?;
             let hash_object = write_object_hash(ObjectHashTypes::Blob(content))?;
             println!("written object hash: {}", hash_object);
+        }
+        Commands::LsTree { hash } => {
+            let object_hash = parse_object_hash(&hash)?;
+            print!("{}", object_hash);
         }
     }
     Ok(())
