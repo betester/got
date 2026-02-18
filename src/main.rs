@@ -2,12 +2,14 @@ use core::fmt;
 use std::{
     env,
     ffi::CStr,
+    fmt::write,
     fs::{self, File},
     io::{BufRead, BufReader, BufWriter, Read, Write},
     os::unix::fs::MetadataExt,
 };
 
 use anyhow::{Context, Result, bail};
+use chrono::{FixedOffset, Utc};
 use clap::{Parser, Subcommand};
 use flate2::Compression;
 use sha1::{Digest, Sha1};
@@ -37,6 +39,13 @@ enum Commands {
         hash: String,
     },
     WriteTree,
+    CommitTree {
+        tree_sha: String,
+        #[arg(short = 'p')]
+        parent_sha: Option<String>,
+        #[arg(short = 'm')]
+        message: String,
+    },
 }
 
 #[derive(Debug, Parser)]
@@ -83,6 +92,23 @@ fn get_object_path(dir_path: &str, hash_path: &str) -> Result<String> {
     return Ok(format!("{}/{}", full_dir_path, possible_hash_path[0]));
 }
 
+// TODO: get the actual author from git config file
+fn get_commit_author_name() -> String {
+    "test_author".to_string()
+}
+
+fn get_commit_author_email() -> String {
+    "test_author@gmail.com".to_string()
+}
+
+fn get_commit_comitter_email() -> String {
+    "test_comitter@gmail.com".to_string()
+}
+
+fn get_commit_comitter_name() -> String {
+    "test_comitter".to_string()
+}
+
 struct TreeNode {
     name: String,
     hash: String,
@@ -125,9 +151,46 @@ impl fmt::Display for TreeNode {
     }
 }
 
+struct CommitContent {
+    tree_sha: String,
+    parent_sha: Option<String>,
+    author_name: String,
+    author_email: String,
+    committer: String,
+    committer_email: String,
+    message: String,
+    timestamp: chrono::DateTime<FixedOffset>,
+}
+
+impl fmt::Display for CommitContent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let _ = writeln!(f, "tree {}", self.tree_sha);
+        if let Some(sha) = &self.parent_sha {
+            let _ = writeln!(f, "parent {}", sha);
+        }
+        let _ = writeln!(
+            f,
+            "author {} {} {}",
+            self.author_name,
+            self.author_email,
+            self.timestamp.format("%s %z").to_string()
+        );
+        let _ = writeln!(
+            f,
+            "committer {} {} {}",
+            self.committer,
+            self.committer_email,
+            self.timestamp.format("%s %z").to_string()
+        );
+
+        write!(f, "\n{}", self.message)
+    }
+}
+
 enum ObjectHashTypes {
     Blob(String),
     Tree(Vec<TreeNode>), // fill in as needed
+    Commit(CommitContent),
 }
 
 impl fmt::Display for ObjectHashTypes {
@@ -139,6 +202,9 @@ impl fmt::Display for ObjectHashTypes {
                     writeln!(f, "{}", tree_node)?;
                 }
                 Ok(())
+            }
+            ObjectHashTypes::Commit(commit_content) => {
+                return write!(f, "{}", commit_content);
             }
         }
     }
@@ -227,6 +293,9 @@ fn parse_object_hash(hash_object: &str) -> Result<ObjectHashTypes> {
             }
             Ok(ObjectHashTypes::Tree(tree_nodes))
         }
+        "commit" => {
+            todo!()
+        }
         _ => bail!(format!("unsupported type: {}", content_type)),
     }
 }
@@ -277,6 +346,15 @@ fn write_object_hash(object_hash_type: ObjectHashTypes) -> Result<String> {
             }
             let meta_data = format!("tree {}\0", content.len());
             (meta_data.as_bytes().to_vec(), content)
+        }
+        ObjectHashTypes::Commit(commit_data) => {
+            let commit_content = commit_data.to_string();
+            let meta_data = format!("commit {}\0", commit_content.len());
+
+            (
+                meta_data.as_bytes().to_vec(),
+                commit_content.as_bytes().to_vec(),
+            )
         }
     };
 
@@ -372,6 +450,33 @@ fn main() -> Result<()> {
 
             let hash = write_object_hash(ObjectHashTypes::Tree(tree_nodes))?;
             println!("written object hash: {}", hash);
+        }
+        Commands::CommitTree {
+            tree_sha,
+            parent_sha,
+            message,
+        } => {
+            let (author_name, author_email, committer, committer_email) = (
+                get_commit_author_name(),
+                get_commit_author_email(),
+                get_commit_comitter_name(),
+                get_commit_comitter_email(),
+            );
+
+            let timestamp = Utc::now().fixed_offset();
+            let commit_content = CommitContent {
+                tree_sha,
+                parent_sha,
+                author_name,
+                author_email,
+                committer,
+                committer_email,
+                message,
+                timestamp,
+            };
+
+            let object_hash = write_object_hash(ObjectHashTypes::Commit(commit_content))?;
+            println!("written object hash: {}", object_hash);
         }
     }
     Ok(())
