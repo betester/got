@@ -294,7 +294,84 @@ fn parse_object_hash(hash_object: &str) -> Result<ObjectHashTypes> {
             Ok(ObjectHashTypes::Tree(tree_nodes))
         }
         "commit" => {
-            todo!()
+            let content = String::from_utf8(buffer).context("parsing commit buffer to utf-8")?;
+
+            let lines: Vec<Option<String>> = content
+                .split('\n')
+                .map(|l| if l.is_empty() { None } else { Some(l.to_string()) })
+                .collect();
+
+            let separator_pos = lines
+                .iter()
+                .position(|l| l.is_none())
+                .with_context(|| "failed to find message separator in commit content")?;
+
+            let message = lines[separator_pos + 1..]
+                .iter()
+                .filter_map(|l| l.as_deref())
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            let header_lines = &lines[..separator_pos];
+
+            const COMMIT_FIELDS: [&str; 4] = ["tree", "parent", "author", "committer"];
+
+            let find_field = |prefix: &str| -> Option<String> {
+                header_lines
+                    .iter()
+                    .filter_map(|l| l.as_deref())
+                    .find(|line| {
+                        line.starts_with(prefix)
+                            && line.as_bytes().get(prefix.len()) == Some(&b' ')
+                    })
+                    .map(|line| line[prefix.len() + 1..].to_string())
+            };
+
+            let tree_sha = find_field(COMMIT_FIELDS[0])
+                .with_context(|| "failed to find tree in commit")?;
+            let parent_sha = find_field(COMMIT_FIELDS[1]);
+            let author_line = find_field(COMMIT_FIELDS[2])
+                .with_context(|| "failed to find author in commit")?;
+            let committer_line = find_field(COMMIT_FIELDS[3])
+                .with_context(|| "failed to find committer in commit")?;
+
+            let author_parts: Vec<&str> = author_line.split(' ').collect();
+            let n = author_parts.len();
+            let author_name = author_parts[..n.saturating_sub(3)].join(" ");
+            let author_email = author_parts
+                .get(n.saturating_sub(3))
+                .with_context(|| format!("failed to parse email from author: {}", author_line))?
+                .to_string();
+            let unix_ts = author_parts
+                .get(n.saturating_sub(2))
+                .with_context(|| "missing unix timestamp in author")?;
+            let tz = author_parts
+                .get(n.saturating_sub(1))
+                .with_context(|| "missing timezone in author")?;
+            let timestamp =
+                chrono::DateTime::parse_from_str(&format!("{} {}", unix_ts, tz), "%s %z")
+                    .with_context(|| format!("failed to parse timestamp: {} {}", unix_ts, tz))?;
+
+            let committer_parts: Vec<&str> = committer_line.split(' ').collect();
+            let m = committer_parts.len();
+            let committer = committer_parts[..m.saturating_sub(3)].join(" ");
+            let committer_email = committer_parts
+                .get(m.saturating_sub(3))
+                .with_context(|| {
+                    format!("failed to parse email from committer: {}", committer_line)
+                })?
+                .to_string();
+
+            Ok(ObjectHashTypes::Commit(CommitContent {
+                tree_sha,
+                parent_sha,
+                author_name,
+                author_email,
+                committer,
+                committer_email,
+                message,
+                timestamp,
+            }))
         }
         _ => bail!(format!("unsupported type: {}", content_type)),
     }
